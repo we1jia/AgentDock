@@ -1,4 +1,4 @@
-import { api, applyTheme, fmtTime, validAccent, type AppSettings, type DockState, type HostInfo, type SeatView } from "./api";
+import { api, applyTheme, fmtTime, METER_AUDIO, validAccent, type AppSettings, type DockState, type HostInfo, type SeatView } from "./api";
 import { iconFor, tintFor } from "./brand";
 import { resolveLang, setLang, t } from "./i18n";
 
@@ -184,7 +184,8 @@ async function render() {
     collapsed.title = p.phase === "in_call" ? t("dock.inCallExpand", { time: fmtTime(p.elapsed_secs) }) : t("dock.expand");
   }
 
-  if (form !== "bar") { await fit(form); kickLens(); return; }
+  // folded away, the waveform is gone and so is any reason to hold the microphone
+  if (form !== "bar") { stopWave(); await fit(form); kickLens(); return; }
   collapsed.removeAttribute("title");
 
   // expanded bar
@@ -195,7 +196,6 @@ async function render() {
 
   if (p.phase === "idle") {
     frag.append(button("ghost", SVG.collapse, t("dock.collapse"), () => api.invoke("set_expanded", { expanded: false })));
-    frag.append(micBtn);
     statusEl = el("div", "status idle");
     frag.append(statusEl);
     frag.append(el("div", "divider"));
@@ -268,21 +268,30 @@ function renderStatusTextInto(e: HTMLDivElement) { statusEl = e; renderStatusTex
 // ───────── waveform: real mic level when available, otherwise a gentle idle motion ─────────
 let waveCanvas: HTMLCanvasElement | null = null;
 let analyser: AnalyserNode | null = null;
-let audioCtx: AudioContext | null = null;
 let raf = 0;
 const bars = new Float32Array(16);
+// The microphone is held only while a call is on the waveform: one try per call, let go after.
+let micOn = false;
+let micGen = 0;
+let releaseMic = () => {};
 
 async function ensureAnalyser() {
-  if (analyser || !navigator.mediaDevices?.getUserMedia) return;
+  if (micOn || !navigator.mediaDevices?.getUserMedia) return;
+  micOn = true;
+  const gen = micGen;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    audioCtx = new AudioContext();
-    const src = audioCtx.createMediaStreamSource(stream);
-    analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 64;
-    analyser.smoothingTimeConstant = .7;
-    src.connect(analyser);
-  } catch { analyser = null; }
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: METER_AUDIO });
+    const ctx = new AudioContext();
+    const release = () => { stream.getTracks().forEach((t) => t.stop()); void ctx.close(); };
+    // the call ended while the microphone was coming up
+    if (gen !== micGen) { release(); return; }
+    const an = ctx.createAnalyser();
+    an.fftSize = 64;
+    an.smoothingTimeConstant = .7;
+    ctx.createMediaStreamSource(stream).connect(an);
+    analyser = an;
+    releaseMic = () => { analyser = null; release(); };
+  } catch { /* no microphone access: the bars keep their gentle motion */ }
 }
 
 function startWave() {
@@ -319,7 +328,12 @@ function startWave() {
 function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
   ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); ctx.fill();
 }
-function stopWave() { cancelAnimationFrame(raf); raf = 0; }
+function stopWave() {
+  cancelAnimationFrame(raf); raf = 0;
+  if (!micOn) return;
+  micOn = false; micGen++;
+  releaseMic(); releaseMic = () => {};
+}
 
 // ───────── wiring ─────────
 collapsed.addEventListener("click", () => {

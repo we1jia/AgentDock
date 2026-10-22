@@ -2312,6 +2312,15 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building AgentDock")
         .run(|app, event| {
+            // A mute is the whole Mac's microphone: it must not outlive AgentDock.
+            if matches!(event, tauri::RunEvent::Exit) {
+                let st = app.state::<AppState>();
+                if st.machine.lock().unwrap().state.muted && st.settings.lock().unwrap().mute_mode == settings::MuteMode::System {
+                    if let Err(e) = st.mic.set_muted(false) {
+                        tracing::warn!("restoring the microphone on exit failed: {e}");
+                    }
+                }
+            }
             // Clicking the Dock icon opens the settings window (the pill is always on screen already).
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = event {

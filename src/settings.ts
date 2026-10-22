@@ -1,4 +1,4 @@
-import { ACCENTS, api, applyTheme, validAccent, type AppSettings, type ChromeStatus, type DriverInfo, type HostInfo, type MemoryStatus, type Seat, type SeatView } from "./api";
+import { ACCENTS, api, applyTheme, METER_AUDIO, validAccent, type AppSettings, type ChromeStatus, type DriverInfo, type HostInfo, type MemoryStatus, type Seat, type SeatView } from "./api";
 import { iconFor } from "./brand";
 import { lang, LANGUAGES, resolveLang, setLang, t, translateDom, type LangSetting, type MsgKey } from "./i18n";
 
@@ -593,9 +593,11 @@ function renderAppearance() {
 }
 
 // ───────────── 麦克风 ─────────────
-let levelRaf = 0;
+/** Lets go of the level meter's microphone: it is held only while the page is on screen. */
+let stopLevel = () => {};
+document.addEventListener("visibilitychange", () => { if (document.hidden) stopLevel(); else if (page === "mic") void renderMic(); });
 async function renderMic() {
-  cancelAnimationFrame(levelRaf);
+  stopLevel();
   const dev = el("select") as HTMLSelectElement; dev.append(new Option(t("mic.default"), ""));
   try {
     const list = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "audioinput");
@@ -612,12 +614,21 @@ async function renderMic() {
     row(t("mic.pauseMedia"), t("mic.pauseMediaSub"), toggle(settings.pause_media_in_call, (v) => saveSettings({ pause_media_in_call: v }))),
     row(t("mic.confirmSwitch"), t("mic.confirmSwitchSub"), toggle(settings.confirm_switch, (v) => saveSettings({ confirm_switch: v }))),
   );
+  if (page !== "mic") return;
   pageEl.replaceChildren(g, g2);
+  if (document.hidden) return;
+  let live = true, raf = 0, release = () => {};
+  const stop = () => { live = false; cancelAnimationFrame(raf); release(); release = () => {}; };
+  stopLevel = stop;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: settings.input_device ? { deviceId: { exact: settings.input_device } } : true });
-    const ctx = new AudioContext(); const an = ctx.createAnalyser(); an.fftSize = 256; ctx.createMediaStreamSource(stream).connect(an);
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { ...METER_AUDIO, ...(settings.input_device ? { deviceId: { exact: settings.input_device } } : {}) } });
+    const ctx = new AudioContext();
+    release = () => { stream.getTracks().forEach((t) => t.stop()); void ctx.close(); };
+    // left the page (or hid the window) while the microphone was coming up
+    if (!live || !level.isConnected) { stop(); return; }
+    const an = ctx.createAnalyser(); an.fftSize = 256; ctx.createMediaStreamSource(stream).connect(an);
     const buf = new Uint8Array(an.frequencyBinCount); const bar = level.firstElementChild as HTMLElement;
-    const tick = () => { if (!level.isConnected) { stream.getTracks().forEach((t) => t.stop()); ctx.close(); return; } an.getByteTimeDomainData(buf); let peak = 0; for (const v of buf) peak = Math.max(peak, Math.abs(v - 128)); bar.style.width = `${Math.min(100, (peak / 128) * 160)}%`; levelRaf = requestAnimationFrame(tick); };
+    const tick = () => { if (!level.isConnected) { stop(); return; } an.getByteTimeDomainData(buf); let peak = 0; for (const v of buf) peak = Math.max(peak, Math.abs(v - 128)); bar.style.width = `${Math.min(100, (peak / 128) * 160)}%`; raf = requestAnimationFrame(tick); };
     tick();
   } catch { (level.firstElementChild as HTMLElement).style.width = "0%"; level.title = t("mic.noPermission"); }
 }
@@ -673,6 +684,7 @@ function renderAbout() {
 
 // ───────────── nav ─────────────
 async function show(p: PageId) {
+  stopLevel();
   page = p;
   document.querySelectorAll<HTMLButtonElement>(".nav__item").forEach((b) => b.classList.toggle("is-active", b.dataset.page === p));
   const [title, sub] = TITLES[p]; $("#title").textContent = t(title);

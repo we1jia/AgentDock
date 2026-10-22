@@ -85,6 +85,9 @@ impl Machine {
         match (self.state.phase.clone(), ev) {
             (_, Event::ToggleExpanded) => self.state.expanded = !self.state.expanded,
             (_, Event::SetExpanded(v)) => self.state.expanded = v,
+            // No call to mute: the switch is the whole Mac's microphone, and turning it off here
+            // would only silence dictation and every other app.
+            (Idle, Event::ToggleMute | Event::SetMuted(_)) => {}
             (_, Event::ToggleMute) => {
                 self.state.muted = !self.state.muted;
                 fx.push(Effect::SystemMute(self.state.muted));
@@ -130,17 +133,13 @@ impl Machine {
             }
             (Switching { from, .. }, Event::Undo) => self.restore_in_call(from, now),
 
-            (Calling { seat }, Event::Hangup) | (InCall { seat, .. }, Event::Hangup) => {
-                self.to_idle();
+            (Calling { seat }, Event::Hangup) | (InCall { seat, .. }, Event::Hangup) | (NeedsHuman { seat, .. }, Event::Hangup) => {
                 fx.push(Effect::DriverHangup(seat));
+                self.to_idle(&mut fx);
             }
             (Switching { from, .. }, Event::Hangup) => {
-                self.to_idle();
                 fx.push(Effect::DriverHangup(from));
-            }
-            (NeedsHuman { seat, .. }, Event::Hangup) => {
-                self.to_idle();
-                fx.push(Effect::DriverHangup(seat));
+                self.to_idle(&mut fx);
             }
 
             // Also out of "needs you": a call the probe only confirmed after the timeout is live after all.
@@ -151,7 +150,7 @@ impl Machine {
             }
             (InCall { seat: cur, .. }, Event::ProbeInCall { seat, in_call: false }) if cur == seat => {
                 // The far side hung up (or the page lost the call).
-                self.to_idle();
+                self.to_idle(&mut fx);
             }
             (_, Event::ProbeNeedsHuman { seat, reason }) => {
                 self.state.phase = NeedsHuman { seat, reason };
@@ -187,11 +186,15 @@ impl Machine {
         fx
     }
 
-    fn to_idle(&mut self) {
+    /// The microphone comes back on with the call gone: a mute left on in idle is the whole Mac's.
+    fn to_idle(&mut self, fx: &mut Vec<Effect>) {
         self.state.phase = Phase::Idle;
         self.call_started = None;
         self.switch_deadline = None;
         self.calling_since = None;
+        if std::mem::take(&mut self.state.muted) {
+            fx.push(Effect::SystemMute(false));
+        }
     }
 
     fn restore_in_call(&mut self, seat: String, now: Instant) {
@@ -243,6 +246,26 @@ mod tests {
         assert_eq!(fx, vec![Effect::DriverHangup("dot".into()), Effect::DriverCall("grok-bot".into())]);
         assert_eq!(m.state.phase, Phase::Calling { seat: "grok-bot".into() });
         assert!(m.state.muted, "mute state is kept across a switch");
+    }
+
+    #[test]
+    fn the_microphone_comes_back_when_the_call_ends_and_idle_never_mutes_it() {
+        let t = Instant::now();
+        let mut m = Machine::new();
+        assert!(m.handle_at(Event::ToggleMute, t).is_empty(), "no call, nothing to mute");
+        assert!(m.handle_at(Event::SetMuted(true), t).is_empty());
+        assert!(!m.state.muted);
+
+        connected(&mut m, "dot", t);
+        m.handle_at(Event::ToggleMute, t);
+        assert_eq!(m.handle_at(Event::Hangup, t), vec![Effect::DriverHangup("dot".into()), Effect::SystemMute(false)]);
+        assert!(!m.state.muted);
+
+        connected(&mut m, "dot", t);
+        m.handle_at(Event::SetMuted(true), t);
+        let fx = m.handle_at(Event::ProbeInCall { seat: "dot".into(), in_call: false }, t + Duration::from_secs(9));
+        assert_eq!(fx, vec![Effect::SystemMute(false)], "the far side hanging up unmutes too");
+        assert_eq!(m.state.phase, Phase::Idle);
     }
 
     #[test]

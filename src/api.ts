@@ -136,9 +136,9 @@ const mock = (() => {
         }, 1000);
       } else if (p.phase === "idle" || p.phase === "needs_human") startCall(a.seatId);
     },
-    hangup: () => { window.clearInterval(timer); setState({ ...state, phase: { phase: "idle" } }); },
-    toggle_mute: () => setState({ ...state, muted: !state.muted }),
-    set_muted: (a) => setState({ ...state, muted: a.muted }),
+    hangup: () => { window.clearInterval(timer); setState({ ...state, phase: { phase: "idle" }, muted: false }); },
+    toggle_mute: () => { if (state.phase.phase !== "idle") setState({ ...state, muted: !state.muted }); },
+    set_muted: (a) => { if (state.phase.phase !== "idle") setState({ ...state, muted: a.muted }); },
     toggle_expanded: () => setState({ ...state, expanded: !state.expanded }),
     set_expanded: (a) => setState({ ...state, expanded: a.expanded }),
     undo_switch: () => { if (state.phase.phase === "switching") { window.clearInterval(undoTimer); setState({ ...state, phase: { phase: "in_call", seat: state.phase.from, elapsed_secs: Math.floor((Date.now() - started) / 1000) } }); } },
@@ -203,6 +203,10 @@ export const api = {
 };
 
 export const fmtTime = (s: number) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+
+/** Level meters want the raw input: echo cancellation would switch on macOS voice processing for
+ *  the microphone, which ducks other apps' audio and is no use to a meter. */
+export const METER_AUDIO: MediaTrackConstraints = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
 
 /** Theme-colour presets (设置 › 外观 › 主题色). `null` = untinted system glass. */
 export const ACCENTS: [string | null, MsgKey][] = [
