@@ -67,10 +67,11 @@ pub fn parse_selector(s: &str) -> Option<AxSelector> {
     Some(AxSelector { role: role.to_string(), class, title })
 }
 
-/// One entry of an app's roster: its name, and why it cannot take a call, if it cannot.
+/// One entry of an app's roster: its name, its id, and why it cannot take a call, if it cannot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RosterEntry {
     pub name: String,
+    pub id: Option<String>,
     pub blocked: Option<String>,
 }
 
@@ -113,8 +114,9 @@ pub fn read_roster(spec: &super::RosterSpec, dir: &std::path::Path) -> Option<Ve
         rows.iter()
             .filter_map(|row| {
                 let name = row.get(&spec.name)?.as_str()?.trim().to_string();
+                let id = spec.id.as_ref().and_then(|field| row.get(field)?.as_str()).map(str::to_string);
                 let blocked = spec.exclude.iter().find(|(field, _)| row.get(field.as_str()).and_then(|v| v.as_bool()) == Some(true)).map(|(_, why)| why.clone());
-                (!name.is_empty()).then_some(RosterEntry { name, blocked })
+                (!name.is_empty()).then_some(RosterEntry { name, id, blocked })
             })
             .collect(),
     )
@@ -128,6 +130,8 @@ fn parse_all(selectors: &[String]) -> Result<Vec<AxSelector>, DriverError> {
 /// after we ask for it, and a freshly launched app still has to load its page.
 const CLICK_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
 const LAUNCH_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long a click with a link to fall back on waits for its element in a running app.
+const LINK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// How long a hang-up may take to clear the call controls.
 const HANGUP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -232,16 +236,29 @@ impl AppDriver {
         let mut ended_stray = false;
         for step in steps {
             match step {
-                Step::Click { selectors } => {
+                Step::Click { selectors, open } => {
                     let sels = parse_all(selectors)?;
-                    let mut found = ax::wait_for(&app, &sels, wait);
+                    let link = match open {
+                        Some(o) => Some((o.url.as_str(), parse_all(&o.until)?)),
+                        None => None,
+                    };
+                    // already where the click would go, e.g. the Bot's chat is the one open
+                    if link.as_ref().is_some_and(|(_, until)| !until.is_empty() && ax::find(&app, until).is_some()) {
+                        continue;
+                    }
+                    let mut found = ax::wait_for(&app, &sels, if link.is_some() && !launched { LINK_WAIT } else { wait });
                     if found.is_none() && mode == Mode::Call && !ended_stray && Self::end_call(&app, spec, &in_call) {
                         ended_stray = true;
                         found = ax::wait_for(&app, &sels, CLICK_WAIT);
                     }
-                    let el = found.ok_or_else(|| DriverError::NotFound(selectors.join(" | ")))?;
-                    if !ax::press(&el) {
-                        return Err(DriverError::Step(format!("AXPress failed: {}", selectors.join(" | "))));
+                    match (found, &link) {
+                        (Some(el), _) => {
+                            if !ax::press(&el) {
+                                return Err(DriverError::Step(format!("AXPress failed: {}", selectors.join(" | "))));
+                            }
+                        }
+                        (None, Some((url, until))) if Self::follow_link(&app, bundle, url, until) => {}
+                        (None, _) => return Err(DriverError::NotFound(selectors.join(" | "))),
                     }
                     wait = CLICK_WAIT;
                 }
@@ -275,7 +292,7 @@ impl AppDriver {
         }
         tracing::info!("{}: a call is still up, ending it before the next one", spec.id);
         for step in &spec.hangup {
-            if let Step::Click { selectors } = step {
+            if let Step::Click { selectors, .. } = step {
                 if let Some(el) = parse_all(selectors).ok().and_then(|s| ax::find(app, &s)) {
                     ax::press(&el);
                 }
@@ -283,6 +300,21 @@ impl AppDriver {
         }
         ax::wait_gone(app, in_call, HANGUP_WAIT);
         true
+    }
+
+    /// Open a deep link the app handles itself and wait until `until` shows it landed. The app
+    /// brings itself forward to handle a link; whatever was in front goes back in front, so the
+    /// rest of the call still happens behind it.
+    #[cfg(target_os = "macos")]
+    fn follow_link(app: &ax::Cf, bundle: &str, url: &str, until: &[AxSelector]) -> bool {
+        tracing::info!("{bundle}: nothing to press, opening {url}");
+        let front = ax::frontmost().filter(|(_, b)| b != bundle);
+        let opened = std::process::Command::new("open").args(["-g", url]).status().is_ok_and(|s| s.success());
+        let landed = opened && if until.is_empty() { std::thread::sleep(CLICK_WAIT); true } else { ax::wait_for(app, until, LAUNCH_WAIT).is_some() };
+        if let Some((pid, _)) = front.filter(|_| ax::frontmost().is_some_and(|(_, b)| b == bundle)) {
+            ax::activate(pid);
+        }
+        landed
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -338,6 +370,12 @@ impl AppDriver {
         let why = Self::roster(spec)?.into_iter().find(|e| e.name == target)?.blocked?;
         // `why` is a key into the native string table ("group_chat"), or plain text from a user driver
         Some(crate::i18n::lookup(&format!("roster.{why}")).map_or_else(|| format!("「{target}」{why}"), |s| s.replace("{target}", target)))
+    }
+
+    /// `target`'s id in the app's roster, for the `{target_id}` of an `open` link.
+    pub fn target_id(spec: &DriverSpec, target: &str) -> Option<String> {
+        let target = target.trim();
+        Self::roster(spec)?.into_iter().find(|e| e.name == target)?.id
     }
 
     /// What the app offers to call, e.g. the Bots in Grok Bot: from its roster when it has one
@@ -514,6 +552,17 @@ mod ax {
             let v = Cf(v);
             as_elements(v.0)
         }
+    }
+
+    /// The app the user is in: its pid and bundle id.
+    pub fn frontmost() -> Option<(i32, String)> {
+        let app = objc2_app_kit::NSWorkspace::sharedWorkspace().frontmostApplication()?;
+        Some((app.processIdentifier(), app.bundleIdentifier()?.to_string()))
+    }
+
+    pub fn activate(pid: i32) -> bool {
+        NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+            .is_some_and(|a| a.activateWithOptions(objc2_app_kit::NSApplicationActivationOptions::empty()))
     }
 
     pub fn pid_of(bundle: &str) -> Option<i32> {
@@ -727,9 +776,14 @@ mod tests {
     fn grok_bot_driver_covers_the_chinese_ui() {
         let reg = super::super::Registry::bundled();
         let spec = reg.get("grok-bot").unwrap();
-        let all = |steps: &[Step]| steps.iter().flat_map(|s| match s { Step::Click { selectors } => selectors.clone(), _ => vec![] }).collect::<Vec<_>>();
+        let all = |steps: &[Step]| steps.iter().flat_map(|s| match s { Step::Click { selectors, .. } => selectors.clone(), _ => vec![] }).collect::<Vec<_>>();
         assert!(all(&spec.call).iter().any(|s| s == "AXButton[发起语音聊天]"));
         assert!(all(&spec.call).iter().any(|s| s == "AXButton.sand-agent-item[@{target}]"), "a Bot is picked by its sidebar row");
+        // the sidebar only renders rows near its scroll position: a Bot off screen opens by link
+        let Some(Step::Click { open: Some(link), .. }) = spec.call.first() else { panic!("the Bot step has a link to fall back on") };
+        assert_eq!(link.url, "grokbot://app/v1/agent?id={target_id}");
+        assert!(link.until.iter().all(|s| parse_selector(s).is_some()) && link.until.iter().any(|s| s.contains("{target}")));
+        assert_eq!(spec.roster.as_ref().and_then(|r| r.id.as_deref()), Some("id"));
         assert!(all(&spec.hangup).iter().any(|s| s == "AXButton[挂断]"));
         assert!(spec.probe.in_call.iter().any(|s| s == "AXButton[挂断]"));
         assert!(spec.targets.iter().all(|s| parse_selector(s).is_some()) && !spec.targets.is_empty());
@@ -764,7 +818,7 @@ mod tests {
             out
         };
         let rows = serde_json::json!({ "schemaVersion": 4, "value": { "rows": [
-            { "name": "Analytics", "isGroup": false, "isHiddenFromSidebar": false },
+            { "id": "c059", "name": "Analytics", "isGroup": false, "isHiddenFromSidebar": false },
             { "name": "图片创作", "isGroup": true },
             { "name": "Old", "isGroup": false, "isHiddenFromSidebar": true },
             { "name": "可乐" }
@@ -774,6 +828,8 @@ mod tests {
         let entries = read_roster(&spec, dir.path()).unwrap();
         let callable: Vec<&str> = entries.iter().filter(|e| e.blocked.is_none()).map(|e| e.name.as_str()).collect();
         assert_eq!(callable, ["Analytics", "可乐"], "group chats and hidden Bots are left out");
+        assert_eq!(entries[0].id.as_deref(), Some("c059"), "ids come along for deep links");
+        assert_eq!(entries[3].id, None);
         assert_eq!(entries.iter().find(|e| e.name == "图片创作").unwrap().blocked.as_deref(), Some("group_chat"));
         assert!(read_roster(&spec, &dir.path().join("missing")).is_none());
     }
@@ -783,7 +839,7 @@ mod tests {
         let reg = super::super::Registry::bundled();
         let spec = reg.get("chatgpt-app").unwrap();
         assert_eq!(spec.bundle_id.as_deref(), Some("com.openai.codex"));
-        let all = |steps: &[Step]| steps.iter().flat_map(|s| match s { Step::Click { selectors } => selectors.clone(), _ => vec![] }).collect::<Vec<_>>();
+        let all = |steps: &[Step]| steps.iter().flat_map(|s| match s { Step::Click { selectors, .. } => selectors.clone(), _ => vec![] }).collect::<Vec<_>>();
         assert!(all(&spec.call).iter().any(|s| s == "AXButton[发起通话]"));
         assert!(all(&spec.hangup).iter().any(|s| s == "AXButton[挂断]"));
         for s in all(&spec.call).iter().chain(all(&spec.hangup).iter()).chain(spec.probe.in_call.iter()) {

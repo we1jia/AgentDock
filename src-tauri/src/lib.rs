@@ -360,7 +360,11 @@ fn run_driver<R: Runtime>(app: &AppHandle<R>, seat_id: &str, op: DriverOp) -> Re
             if let (DriverOp::Call, Some(why)) = (op, seat.target.as_deref().and_then(|t| AppDriver::refusal(spec, t))) {
                 return Err(DriverError::NotCallable(why));
             }
-            let steps = |s: &[drivers::Step]| drivers::bind_target(s, seat.target.as_deref());
+            let target_id = match op {
+                DriverOp::Call => seat.target.as_deref().and_then(|t| AppDriver::target_id(spec, t)),
+                _ => None,
+            };
+            let steps = |s: &[drivers::Step]| drivers::bind_target(s, seat.target.as_deref(), target_id.as_deref());
             let res = match op {
                 DriverOp::Call => AppDriver::place_call(spec, &steps(&spec.call)),
                 DriverOp::Hangup => AppDriver::hang_up(spec, &steps(&spec.hangup)),

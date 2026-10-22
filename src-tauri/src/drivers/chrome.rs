@@ -291,7 +291,7 @@ mod tests {
         use super::super::{steps_script, Step};
         let chrome = Chrome::default();
         let page = "data:text/html,<button aria-label='Start voice chat' onclick=\"document.title='called'\">call</button>";
-        let click = |sel: &str| steps_script(&[Step::Click { selectors: vec![sel.to_string()] }]);
+        let click = |sel: &str| steps_script(&[Step::Click { selectors: vec![sel.to_string()], open: None }]);
         chrome.eval("t", page, &click("button[aria-label='Start voice chat']"), true).unwrap();
         assert!(chrome.has_tab("t"));
         assert_eq!(chrome.eval("t", page, "document.title", false).unwrap(), json!("called"));

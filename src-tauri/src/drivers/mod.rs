@@ -15,6 +15,9 @@ pub enum Step {
     /// Click the first visible element matching the selector (tries each selector in order).
     Click {
         selectors: Vec<String>,
+        /// App seats: a deep link to the same place, for when nothing matches.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        open: Option<OpenLink>,
     },
     /// Wait for a selector to appear (ms budget).
     WaitFor {
@@ -36,6 +39,17 @@ pub enum Step {
     Clear {
         selectors: Vec<String>,
     },
+}
+
+/// A deep link that lands where a click would have, for an element the app left out of its
+/// accessibility tree: Grok Bot's sidebar only renders the Bot rows near its scroll position.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenLink {
+    /// `{target_id}` is the target's id in the app's roster, `{target}` its name (both URL-encoded).
+    pub url: String,
+    /// Present once the link has landed; already present means the click is not needed at all.
+    #[serde(default)]
+    pub until: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +123,9 @@ pub struct RosterSpec {
     pub rows: String,
     /// Field holding an entry's name (what `{target}` gets).
     pub name: String,
+    /// Field holding an entry's id (what `{target_id}` gets in a step's `open` link).
+    #[serde(default)]
+    pub id: Option<String>,
     /// Boolean fields that make an entry uncallable, with the reason shown to the user: a key
     /// of the native string table under `roster.` ("group_chat"), or plain text.
     #[serde(default)]
@@ -118,7 +135,7 @@ pub struct RosterSpec {
 /// Whether any step selector mentions `{target}`.
 pub fn uses_target(steps: &[Step]) -> bool {
     steps.iter().any(|s| match s {
-        Step::Click { selectors } | Step::Clear { selectors } | Step::WaitFor { selectors, .. } => selectors.iter().any(|x| x.contains("{target}")),
+        Step::Click { selectors, .. } | Step::Clear { selectors } | Step::WaitFor { selectors, .. } => selectors.iter().any(|x| x.contains("{target}")),
         _ => false,
     })
 }
@@ -387,9 +404,10 @@ pub fn transcript_script(selectors: &[String], seat_id: &str) -> String {
     )
 }
 
-/// Fill a seat's `target` (e.g. which Bot inside Grok Bot) into `{target}` in step selectors.
+/// Fill a seat's `target` (e.g. which Bot inside Grok Bot) into `{target}` in step selectors, and
+/// its roster id into `{target_id}` in `open` links (a link missing a value is left out).
 /// Without a target, steps that mention `{target}` are dropped, along with a `sleep` right after.
-pub fn bind_target(steps: &[Step], target: Option<&str>) -> Vec<Step> {
+pub fn bind_target(steps: &[Step], target: Option<&str>, target_id: Option<&str>) -> Vec<Step> {
     let target = target.map(str::trim).filter(|t| !t.is_empty());
     let mut out = Vec::with_capacity(steps.len());
     let mut dropped = false;
@@ -401,7 +419,10 @@ pub fn bind_target(steps: &[Step], target: Option<&str>) -> Vec<Step> {
             target.map(|t| Some(sels.iter().map(|s| s.replace("{target}", t)).collect()))
         };
         let bound = match step {
-            Step::Click { selectors } => bind(selectors).map(|b| b.map_or_else(|| step.clone(), |selectors| Step::Click { selectors })),
+            Step::Click { selectors, open } => bind(selectors).map(|b| Step::Click {
+                selectors: b.unwrap_or_else(|| selectors.clone()),
+                open: open.as_ref().and_then(|o| bind_link(o, target, target_id)),
+            }),
             Step::Clear { selectors } => bind(selectors).map(|b| b.map_or_else(|| step.clone(), |selectors| Step::Clear { selectors })),
             Step::WaitFor { selectors, timeout_ms } => bind(selectors).map(|b| b.map_or_else(|| step.clone(), |selectors| Step::WaitFor { selectors, timeout_ms: *timeout_ms })),
             Step::Sleep { .. } if dropped => None,
@@ -411,6 +432,22 @@ pub fn bind_target(steps: &[Step], target: Option<&str>) -> Vec<Step> {
         out.extend(bound);
     }
     out
+}
+
+fn bind_link(link: &OpenLink, target: Option<&str>, target_id: Option<&str>) -> Option<OpenLink> {
+    let mut url = link.url.clone();
+    for (key, value) in [("{target_id}", target_id), ("{target}", target)] {
+        if url.contains(key) {
+            url = url.replace(key, &url_encode(value?));
+        }
+    }
+    let until = link.until.iter().map(|s| target.map_or_else(|| s.clone(), |t| s.replace("{target}", t))).collect();
+    Some(OpenLink { url, until })
+}
+
+/// Percent-encode everything but RFC 3986 unreserved characters.
+fn url_encode(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { char::from(b).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
 /// JS that runs a step list sequentially inside the page.
@@ -522,17 +559,32 @@ mod tests {
     #[test]
     fn target_fills_selectors_or_drops_its_steps() {
         let steps = vec![
-            Step::Click { selectors: vec!["AXLink[{target}]".into()] },
+            Step::Click { selectors: vec!["AXLink[{target}]".into()], open: None },
             Step::Sleep { ms: 1200 },
             Step::Clear { selectors: vec!["AXTextArea".into()] },
-            Step::Click { selectors: vec!["AXButton[发起语音聊天]".into()] },
+            Step::Click { selectors: vec!["AXButton[发起语音聊天]".into()], open: None },
         ];
-        let bound = bind_target(&steps, Some(" Analytics "));
-        assert_eq!(bound[0], Step::Click { selectors: vec!["AXLink[Analytics]".into()] });
+        let bound = bind_target(&steps, Some(" Analytics "), None);
+        assert_eq!(bound[0], Step::Click { selectors: vec!["AXLink[Analytics]".into()], open: None });
         assert_eq!(bound.len(), 4);
-        let plain = bind_target(&steps, None);
+        let plain = bind_target(&steps, None, None);
         assert_eq!(plain, steps[2..].to_vec(), "no target: the select step and its pause are skipped");
-        assert_eq!(bind_target(&steps, Some("  ")), plain);
+        assert_eq!(bind_target(&steps, Some("  "), None), plain);
+    }
+
+    #[test]
+    fn open_links_get_the_target_and_its_id_or_are_left_out() {
+        let link = |url: &str| Some(OpenLink { url: url.into(), until: vec!["AXGroup.sand-chat[{target}]".into()] });
+        let step = |url: &str| vec![Step::Click { selectors: vec!["AXButton[{target}]".into()], open: link(url) }];
+        let open_of = |steps: Vec<Step>| match steps.into_iter().next() {
+            Some(Step::Click { open, .. }) => open,
+            other => panic!("{other:?}"),
+        };
+        let bound = open_of(bind_target(&step("grokbot://app/v1/agent?id={target_id}"), Some("Content"), Some("ea70-0b4c")));
+        assert_eq!(bound, Some(OpenLink { url: "grokbot://app/v1/agent?id=ea70-0b4c".into(), until: vec!["AXGroup.sand-chat[Content]".into()] }));
+        let named = open_of(bind_target(&step("app://bot?name={target}"), Some("图片 创作&"), None)).unwrap();
+        assert_eq!(named.url, "app://bot?name=%E5%9B%BE%E7%89%87%20%E5%88%9B%E4%BD%9C%26", "names are URL-encoded");
+        assert_eq!(open_of(bind_target(&step("grokbot://app/v1/agent?id={target_id}"), Some("Content"), None)), None, "no id, no link: the click alone decides");
     }
 
     #[test]

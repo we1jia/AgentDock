@@ -1,7 +1,7 @@
 {
   "id": "grok-bot",
   "display_name": "Grok Bot",
-  "version": 4,
+  "version": 5,
   "verified": false,
   "url": null,
   "bundle_id": "com.anysphere.sand",
@@ -13,13 +13,15 @@
     "key_suffix": ".roster.last-roster",
     "rows": "/value/rows",
     "name": "name",
+    "id": "id",
     "exclude": {
       "isGroup": "group_chat",
       "isHiddenFromSidebar": "hidden"
     }
   },
   "call": [
-    { "op": "click", "selectors": ["AXButton.sand-agent-item[@{target}]", "AXCheckBox.sand-agent-item[@{target}]", "AXButton[{target}]", "AXCheckBox[{target}]", "AXButton.sand-agent-item[~{target}]"] },
+    { "op": "click", "selectors": ["AXButton.sand-agent-item[@{target}]", "AXCheckBox.sand-agent-item[@{target}]", "AXButton[{target}]", "AXCheckBox[{target}]", "AXButton.sand-agent-item[~{target}]"],
+      "open": { "url": "grokbot://app/v1/agent?id={target_id}", "until": ["AXGroup.sand-chat[{target}]"] } },
     { "op": "sleep", "ms": 1200 },
     { "op": "clear", "selectors": ["AXTextArea", "AXTextField"] },
     { "op": "click", "selectors": ["AXButton[发起语音聊天]", "AXButton[發起語音聊天]", "AXButton[Start voice chat]", "AXButton[音声チャットを開始]"] }
