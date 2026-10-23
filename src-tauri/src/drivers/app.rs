@@ -132,6 +132,9 @@ const CLICK_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
 const LAUNCH_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 /// How long a click with a link to fall back on waits for its element in a running app.
 const LINK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a press may take to show its effect before the app is taken for throttled: awake,
+/// Grok Bot shows a call's controls half a second after its call button is pressed.
+const CONFIRM_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
 /// How long a hang-up may take to clear the call controls.
 const HANGUP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -144,6 +147,37 @@ enum Mode {
 
 #[derive(Debug, Default)]
 pub struct AppDriver;
+
+/// The app the user is in, while `bundle` may come forward (it activates itself to handle one of
+/// its deep links). Dropping this hands the foreground back to the user's app, so a call goes on
+/// behind it.
+#[cfg(target_os = "macos")]
+struct Forward {
+    bundle: String,
+    back_to: Option<i32>,
+}
+
+#[cfg(target_os = "macos")]
+impl Forward {
+    fn keep(bundle: &str) -> Self {
+        Forward { bundle: bundle.to_string(), back_to: ax::frontmost().filter(|(_, b)| b != bundle).map(|(pid, _)| pid) }
+    }
+
+    fn open(bundle: &str, url: &str) -> Option<Self> {
+        let forward = Self::keep(bundle);
+        let opened = std::process::Command::new("open").args(["-g", url]).status().is_ok_and(|s| s.success());
+        opened.then_some(forward)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Forward {
+    fn drop(&mut self) {
+        if let Some(pid) = self.back_to.filter(|_| ax::frontmost().is_some_and(|(_, b)| b == self.bundle)) {
+            ax::activate(pid);
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -229,14 +263,17 @@ impl AppDriver {
         if !Self::is_ax_trusted() {
             return Err(DriverError::NeedsAuth);
         }
-        let (pid, launched) = Self::ensure_running(bundle)?;
+        // an app woken by a link may only come forward after the link landed
+        let _front = (mode == Mode::Call).then(|| Forward::keep(bundle));
+        let (pid, launched) = Self::ensure_running(bundle, &spec.launch_args)?;
         let app = ax::app(pid);
         let in_call = parse_all(&spec.probe.in_call)?;
         let mut wait = if launched { LAUNCH_WAIT } else { CLICK_WAIT };
         let mut ended_stray = false;
         for step in steps {
+            tracing::debug!("{} {mode:?}: {step:?}", spec.id);
             match step {
-                Step::Click { selectors, open } => {
+                Step::Click { selectors, open, wake } => {
                     let sels = parse_all(selectors)?;
                     let link = match open {
                         Some(o) => Some((o.url.as_str(), parse_all(&o.until)?)),
@@ -244,6 +281,7 @@ impl AppDriver {
                     };
                     // already where the click would go, e.g. the Bot's chat is the one open
                     if link.as_ref().is_some_and(|(_, until)| !until.is_empty() && ax::find(&app, until).is_some()) {
+                        tracing::debug!("{}: already there, no click", spec.id);
                         continue;
                     }
                     let mut found = ax::wait_for(&app, &sels, if link.is_some() && !launched { LINK_WAIT } else { wait });
@@ -253,8 +291,23 @@ impl AppDriver {
                     }
                     match (found, &link) {
                         (Some(el), _) => {
+                            tracing::debug!("{}: pressing {}", spec.id, ax::describe(&el));
                             if !ax::press(&el) {
                                 return Err(DriverError::Step(format!("AXPress failed: {}", selectors.join(" | "))));
+                            }
+                            // the press lands where the link would; when it does not (a throttled
+                            // app), the link both wakes the app and takes it there
+                            let landed = match &link {
+                                Some((url, until)) if !until.is_empty() => {
+                                    ax::wait_for(&app, until, CONFIRM_WAIT).is_some() || Self::follow_link(&app, bundle, url, until)
+                                }
+                                _ => true,
+                            };
+                            if !landed {
+                                return Err(DriverError::NotFound(selectors.join(" | ")));
+                            }
+                            if let Some(w) = wake {
+                                Self::confirm(&app, bundle, &sels, &parse_all(&w.until)?, &w.url);
                             }
                         }
                         (None, Some((url, until))) if Self::follow_link(&app, bundle, url, until) => {}
@@ -262,8 +315,9 @@ impl AppDriver {
                     }
                     wait = CLICK_WAIT;
                 }
+                // only a field with text in it: setting an empty one still counts as an edit
                 Step::Clear { selectors } => {
-                    if let Some(el) = ax::find(&app, &parse_all(selectors)?) {
+                    if let Some(el) = ax::find(&app, &parse_all(selectors)?).filter(|el| ax::value(el).is_some_and(|v| !v.trim().is_empty())) {
                         ax::set_value(&el, "");
                     }
                 }
@@ -302,19 +356,36 @@ impl AppDriver {
         true
     }
 
-    /// Open a deep link the app handles itself and wait until `until` shows it landed. The app
-    /// brings itself forward to handle a link; whatever was in front goes back in front, so the
-    /// rest of the call still happens behind it.
+    /// Open a deep link the app handles itself and wait until `until` shows it landed.
     #[cfg(target_os = "macos")]
     fn follow_link(app: &ax::Cf, bundle: &str, url: &str, until: &[AxSelector]) -> bool {
         tracing::info!("{bundle}: nothing to press, opening {url}");
-        let front = ax::frontmost().filter(|(_, b)| b != bundle);
-        let opened = std::process::Command::new("open").args(["-g", url]).status().is_ok_and(|s| s.success());
-        let landed = opened && if until.is_empty() { std::thread::sleep(CLICK_WAIT); true } else { ax::wait_for(app, until, LAUNCH_WAIT).is_some() };
-        if let Some((pid, _)) = front.filter(|_| ax::frontmost().is_some_and(|(_, b)| b == bundle)) {
-            ax::activate(pid);
+        let Some(_forward) = Forward::open(bundle, url) else { return false };
+        if until.is_empty() {
+            std::thread::sleep(CLICK_WAIT);
+            return true;
         }
-        landed
+        ax::wait_for(app, until, LAUNCH_WAIT).is_some()
+    }
+
+    /// After a press, `until` should show it took effect. An Electron app whose window has been
+    /// out of sight for a few minutes is throttled and may handle the press a minute later; with
+    /// its window up it handles the press at once. A press it never got is pressed again.
+    #[cfg(target_os = "macos")]
+    fn confirm(app: &ax::Cf, bundle: &str, sels: &[AxSelector], until: &[AxSelector], wake: &str) {
+        if until.is_empty() || ax::wait_for(app, until, CONFIRM_WAIT).is_some() {
+            return;
+        }
+        tracing::info!("{bundle}: no reaction to the press, waking it with {wake}");
+        let Some(_forward) = Forward::open(bundle, wake) else { return };
+        if ax::wait_for(app, until, CLICK_WAIT).is_some() {
+            return;
+        }
+        if let Some(el) = ax::find(app, sels) {
+            tracing::info!("{bundle}: pressing again, awake");
+            ax::press(&el);
+            ax::wait_for(app, until, CLICK_WAIT);
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -400,7 +471,7 @@ impl AppDriver {
         if !Self::is_ax_trusted() {
             return Err(DriverError::NeedsAuth);
         }
-        let (pid, launched) = Self::ensure_running(bundle)?;
+        let (pid, launched) = Self::ensure_running(bundle, &spec.launch_args)?;
         let app = ax::app(pid);
         let wait = if launched { LAUNCH_WAIT } else { CLICK_WAIT };
         let t0 = std::time::Instant::now();
@@ -418,17 +489,17 @@ impl AppDriver {
         Err(DriverError::Unsupported)
     }
 
-    /// The app's pid, plus whether it had to be (re)opened. A missing app is launched hidden and a
-    /// running one without windows gets a reopen event; neither is activated.
+    /// The app's pid, plus whether it had to be (re)opened. A missing app is launched hidden (with
+    /// `args`) and a running one without windows gets a reopen event; neither is activated.
     #[cfg(target_os = "macos")]
-    fn ensure_running(bundle: &str) -> Result<(i32, bool), DriverError> {
-        if let Some(pid) = ax::pid_of(bundle) {
+    fn ensure_running(bundle: &str, args: &[String]) -> Result<(i32, bool), DriverError> {
+        let running = ax::pid_of(bundle);
+        if let Some(pid) = running {
             if ax::has_window(&ax::app(pid)) {
                 return Ok((pid, false));
             }
         }
-        let opened = std::process::Command::new("open").args(["-g", "-j", "-b", bundle]).status().map_err(|e| DriverError::Step(e.to_string()))?;
-        if !opened.success() {
+        if !Self::launch(bundle, if running.is_some() { &[] } else { args }) {
             return Err(DriverError::Unsupported);
         }
         let t0 = std::time::Instant::now();
@@ -439,6 +510,50 @@ impl AppDriver {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
         Err(DriverError::Step(format!("{bundle} did not start")))
+    }
+
+    /// `open` the app hidden and in the background; `args` only reach an app that was not running.
+    #[cfg(target_os = "macos")]
+    fn launch(bundle: &str, args: &[String]) -> bool {
+        let mut cmd = std::process::Command::new("open");
+        cmd.args(["-g", "-j", "-b", bundle]);
+        if !args.is_empty() {
+            cmd.arg("--args").args(args);
+        }
+        cmd.status().is_ok_and(|s| s.success())
+    }
+
+    /// Restart the app with `spec.launch_args` when it runs without them (started by the user, or
+    /// by its own updater). Only once the user has left it for a while, showing no call, and at
+    /// most once per process. Meant to be called every half minute or so; `true` when restarted.
+    #[cfg(target_os = "macos")]
+    pub fn adopt(spec: &DriverSpec) -> bool {
+        /// Pids already restarted (or that would not quit), and when each app was last in front.
+        static TRIED: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+        static IN_FRONT: std::sync::Mutex<Vec<(String, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+        const LEFT_FOR: std::time::Duration = std::time::Duration::from_secs(120);
+        let (Some(first), Some(bundle)) = (spec.launch_args.first(), spec.bundle_id.as_deref().map(Self::resolve_bundle_id)) else { return false };
+        let Some(pid) = ax::pid_of(bundle) else { return false };
+        let mut tried = TRIED.lock().unwrap_or_else(|e| e.into_inner());
+        if tried.contains(&pid) || ax::args_of(pid).map_or(true, |a| a.contains(first.as_str())) {
+            return false;
+        }
+        let mut in_front = IN_FRONT.lock().unwrap_or_else(|e| e.into_inner());
+        if ax::frontmost().is_some_and(|(_, b)| b == bundle) {
+            in_front.retain(|(b, _)| b != bundle);
+            in_front.push((bundle.to_string(), std::time::Instant::now()));
+        }
+        if in_front.iter().any(|(b, at)| b == bundle && at.elapsed() < LEFT_FOR) || Self::probe(spec).is_ok_and(|p| p.in_call || p.needs_human) {
+            return false;
+        }
+        tried.push(pid);
+        tracing::info!("{bundle}: restarting it with {:?}, so it answers in the background", spec.launch_args);
+        ax::terminate(pid, LAUNCH_WAIT) && Self::launch(bundle, &spec.launch_args)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn adopt(_spec: &DriverSpec) -> bool {
+        false
     }
 
     /// Bring the app forward: only when the user asks to look at it.
@@ -563,6 +678,26 @@ mod ax {
     pub fn activate(pid: i32) -> bool {
         NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
             .is_some_and(|a| a.activateWithOptions(objc2_app_kit::NSApplicationActivationOptions::empty()))
+    }
+
+    /// The command line a process was started with.
+    pub fn args_of(pid: i32) -> Option<String> {
+        let out = std::process::Command::new("ps").args(["-o", "args=", "-p", &pid.to_string()]).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    /// Ask the app to quit, the way its own Quit menu item would, and wait (bounded) for it to go.
+    pub fn terminate(pid: i32, timeout: std::time::Duration) -> bool {
+        let gone = || NSRunningApplication::runningApplicationWithProcessIdentifier(pid).is_none();
+        let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) else { return true };
+        if !app.terminate() {
+            return false;
+        }
+        let t0 = std::time::Instant::now();
+        while !gone() && t0.elapsed() < timeout {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        gone()
     }
 
     pub fn pid_of(bundle: &str) -> Option<i32> {
@@ -696,8 +831,18 @@ mod ax {
         }
     }
 
+    /// Role and labels, for logs.
+    pub fn describe(el: &Cf) -> String {
+        let labels: Vec<String> = ["AXTitle", "AXDescription", "AXHelp", "AXValue"].iter().filter_map(|k| string_attr(el, k)).filter(|s| !s.is_empty()).collect();
+        format!("{} {labels:?}", string_attr(el, "AXRole").unwrap_or_default())
+    }
+
     pub fn press(el: &Cf) -> bool {
         unsafe { AXUIElementPerformAction(el.0, cf(&key("AXPress"))) == 0 }
+    }
+
+    pub fn value(el: &Cf) -> Option<String> {
+        string_attr(el, "AXValue")
     }
 
     pub fn set_value(el: &Cf, value: &str) -> bool {
@@ -784,6 +929,11 @@ mod tests {
         assert_eq!(link.url, "grokbot://app/v1/agent?id={target_id}");
         assert!(link.until.iter().all(|s| parse_selector(s).is_some()) && link.until.iter().any(|s| s.contains("{target}")));
         assert_eq!(spec.roster.as_ref().and_then(|r| r.id.as_deref()), Some("id"));
+        // in the background Grok Bot is throttled: started without it, woken when a press stalls
+        assert!(spec.launch_args.iter().any(|a| a == "--disable-background-timer-throttling"));
+        let Some(Step::Click { wake: Some(wake), .. }) = spec.call.last() else { panic!("the call button wakes the app when the press stalls") };
+        assert_eq!(wake.url, "grokbot://app/v1/open");
+        assert_eq!(wake.until, spec.probe.in_call, "the press took when the call's controls show");
         assert!(all(&spec.hangup).iter().any(|s| s == "AXButton[挂断]"));
         assert!(spec.probe.in_call.iter().any(|s| s == "AXButton[挂断]"));
         assert!(spec.targets.iter().all(|s| parse_selector(s).is_some()) && !spec.targets.is_empty());

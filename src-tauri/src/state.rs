@@ -47,7 +47,8 @@ pub enum Effect {
 }
 
 pub const UNDO_WINDOW: Duration = Duration::from_secs(3);
-pub const CALL_TIMEOUT: Duration = Duration::from_secs(15);
+/// Long enough for an app woken from background throttling to put the call through.
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(25);
 /// The Dock shows this reason in the user's language (src/i18n.ts `dock.callTimeout`).
 pub const REASON_CALL_TIMEOUT: &str = "call_timeout";
 
@@ -312,8 +313,9 @@ mod tests {
         assert_eq!(fx, vec![Effect::DriverHangup("grok-a".into()), Effect::DriverCall("grok-b".into())], "hang up, then dial, in that order");
         assert!(matches!(m.state.phase, Phase::Calling { ref seat } if seat == "grok-b"));
         // retrying the same seat just dials again
-        m.handle_at(Event::Tick, t + Duration::from_secs(40));
-        assert_eq!(m.handle_at(Event::Call("grok-b".into()), t + Duration::from_secs(41)), vec![Effect::DriverCall("grok-b".into())]);
+        let later = t + Duration::from_secs(21) + CALL_TIMEOUT;
+        m.handle_at(Event::Tick, later);
+        assert_eq!(m.handle_at(Event::Call("grok-b".into()), later + Duration::from_secs(1)), vec![Effect::DriverCall("grok-b".into())]);
     }
 
     #[test]

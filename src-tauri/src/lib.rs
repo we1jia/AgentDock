@@ -382,6 +382,24 @@ fn run_driver<R: Runtime>(app: &AppHandle<R>, seat_id: &str, op: DriverOp) -> Re
     }
 }
 
+/// Restart the apps of app seats that run without their launch arguments (`AppDriver::adopt`),
+/// idle only, holding the driver lane so a call placed meanwhile waits for the app to be back.
+fn adopt_apps<R: Runtime>(app: &AppHandle<R>) {
+    let st = app.state::<AppState>();
+    let Ok(_lane) = st.driver_lane.try_lock() else { return };
+    let mut drivers: Vec<String> = st.seats.lock().unwrap().seats.iter()
+        .filter(|s| s.enabled)
+        .filter_map(|s| match &s.driver { DriverKind::App { driver, .. } => Some(driver.clone()), DriverKind::Web { .. } => None })
+        .collect();
+    drivers.sort();
+    drivers.dedup();
+    for spec in drivers.iter().filter_map(|id| st.registry.get(id).ok()).filter(|d| !d.pending && !d.launch_args.is_empty()) {
+        if matches!(st.machine.lock().unwrap().state.phase, Phase::Idle) {
+            AppDriver::adopt(spec);
+        }
+    }
+}
+
 /// Web seats go to the user's Chrome when remote debugging is on there (and the setting allows),
 /// or once a Chrome connection exists; otherwise to AgentDock's own hidden webview.
 fn use_chrome(st: &AppState) -> bool {
@@ -2274,6 +2292,10 @@ pub fn run() {
                     // Mid call / hang-up nothing is settled: in a switch between two Bots of one
                     // app, the old call is still up and would read as the new one connecting.
                     let drivers_busy = st.driver_lane.try_lock().is_err();
+                    if n % 60 == 30 && phase_idle && !drivers_busy {
+                        let handle = handle.clone();
+                        tauri::async_runtime::spawn_blocking(move || adopt_apps(&handle));
+                    }
                     for seat in seats.iter().filter(|s| s.enabled || logging_in.contains(&s.id)) {
                         let is_active = active.as_deref() == Some(seat.id.as_str());
                         let is_login = logging_in.contains(&seat.id);

@@ -18,6 +18,11 @@ pub enum Step {
         /// App seats: a deep link to the same place, for when nothing matches.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         open: Option<OpenLink>,
+        /// App seats: `until` shows the press took effect (a call's controls after its call
+        /// button). When it does not show up the app is throttled in the background, where it can
+        /// take a minute to handle a press, and `url` brings it forward to wake it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wake: Option<OpenLink>,
     },
     /// Wait for a selector to appear (ms budget).
     WaitFor {
@@ -110,6 +115,11 @@ pub struct DriverSpec {
     /// entries cannot take a call (group chats).
     #[serde(default)]
     pub roster: Option<RosterSpec>,
+    /// App seats: arguments the app is started with when AgentDock starts it, and restarted with
+    /// (idle, in the background) when it runs without them. Grok Bot gets Chromium's switches
+    /// against background throttling: throttled, it handles a press up to a minute late.
+    #[serde(default)]
+    pub launch_args: Vec<String>,
 }
 
 /// A JSON roster in a key-value store directory whose file names are base32 keys
@@ -419,9 +429,10 @@ pub fn bind_target(steps: &[Step], target: Option<&str>, target_id: Option<&str>
             target.map(|t| Some(sels.iter().map(|s| s.replace("{target}", t)).collect()))
         };
         let bound = match step {
-            Step::Click { selectors, open } => bind(selectors).map(|b| Step::Click {
+            Step::Click { selectors, open, wake } => bind(selectors).map(|b| Step::Click {
                 selectors: b.unwrap_or_else(|| selectors.clone()),
                 open: open.as_ref().and_then(|o| bind_link(o, target, target_id)),
+                wake: wake.as_ref().and_then(|w| bind_link(w, target, target_id)),
             }),
             Step::Clear { selectors } => bind(selectors).map(|b| b.map_or_else(|| step.clone(), |selectors| Step::Clear { selectors })),
             Step::WaitFor { selectors, timeout_ms } => bind(selectors).map(|b| b.map_or_else(|| step.clone(), |selectors| Step::WaitFor { selectors, timeout_ms: *timeout_ms })),
@@ -559,13 +570,13 @@ mod tests {
     #[test]
     fn target_fills_selectors_or_drops_its_steps() {
         let steps = vec![
-            Step::Click { selectors: vec!["AXLink[{target}]".into()], open: None },
+            Step::Click { selectors: vec!["AXLink[{target}]".into()], open: None, wake: None },
             Step::Sleep { ms: 1200 },
             Step::Clear { selectors: vec!["AXTextArea".into()] },
-            Step::Click { selectors: vec!["AXButton[发起语音聊天]".into()], open: None },
+            Step::Click { selectors: vec!["AXButton[发起语音聊天]".into()], open: None, wake: None },
         ];
         let bound = bind_target(&steps, Some(" Analytics "), None);
-        assert_eq!(bound[0], Step::Click { selectors: vec!["AXLink[Analytics]".into()], open: None });
+        assert_eq!(bound[0], Step::Click { selectors: vec!["AXLink[Analytics]".into()], open: None, wake: None });
         assert_eq!(bound.len(), 4);
         let plain = bind_target(&steps, None, None);
         assert_eq!(plain, steps[2..].to_vec(), "no target: the select step and its pause are skipped");
@@ -575,7 +586,7 @@ mod tests {
     #[test]
     fn open_links_get_the_target_and_its_id_or_are_left_out() {
         let link = |url: &str| Some(OpenLink { url: url.into(), until: vec!["AXGroup.sand-chat[{target}]".into()] });
-        let step = |url: &str| vec![Step::Click { selectors: vec!["AXButton[{target}]".into()], open: link(url) }];
+        let step = |url: &str| vec![Step::Click { selectors: vec!["AXButton[{target}]".into()], open: link(url), wake: link("grokbot://app/v1/open") }];
         let open_of = |steps: Vec<Step>| match steps.into_iter().next() {
             Some(Step::Click { open, .. }) => open,
             other => panic!("{other:?}"),

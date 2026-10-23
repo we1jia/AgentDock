@@ -1,13 +1,14 @@
 {
   "id": "grok-bot",
   "display_name": "Grok Bot",
-  "version": 5,
+  "version": 6,
   "verified": false,
   "url": null,
   "bundle_id": "com.anysphere.sand",
   "user_agent": null,
   "targets": ["AXButton.sand-agent-item", "AXCheckBox.sand-agent-item"],
   "target_noun": "Bot",
+  "launch_args": ["--disable-renderer-backgrounding", "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows"],
   "roster": {
     "dir": "~/Library/Application Support/Grok Bot/sand-client-persistence",
     "key_suffix": ".roster.last-roster",
@@ -24,7 +25,8 @@
       "open": { "url": "grokbot://app/v1/agent?id={target_id}", "until": ["AXGroup.sand-chat[{target}]"] } },
     { "op": "sleep", "ms": 1200 },
     { "op": "clear", "selectors": ["AXTextArea", "AXTextField"] },
-    { "op": "click", "selectors": ["AXButton[发起语音聊天]", "AXButton[發起語音聊天]", "AXButton[Start voice chat]", "AXButton[音声チャットを開始]"] }
+    { "op": "click", "selectors": ["AXButton[发起语音聊天]", "AXButton[發起語音聊天]", "AXButton[Start voice chat]", "AXButton[音声チャットを開始]"],
+      "wake": { "url": "grokbot://app/v1/open", "until": ["AXButton[挂断]", "AXButton[掛斷]", "AXButton[Hang up]", "AXButton[通話を終了]"] } }
   ],
   "hangup": [
     { "op": "click", "selectors": ["AXButton[挂断]", "AXButton[掛斷]", "AXButton[Hang up]", "AXButton[通話を終了]"] }
