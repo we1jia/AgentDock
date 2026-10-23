@@ -2135,8 +2135,9 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 // ───────────────────────── run ─────────────────────────
 
 pub fn run() {
+    // RUST_LOG wins when set (e.g. `agentdock_lib=debug` to trace driver steps)
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("agentdock=info".parse().unwrap()).add_directive("agentdock_lib=info".parse().unwrap()))
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("agentdock=info,agentdock_lib=info")))
         .init();
 
     tauri::Builder::default()
